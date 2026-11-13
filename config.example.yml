@@ -1,0 +1,21 @@
+# Copy to config.yml.
+
+# GitOps repo holding one kustomize image patch per environment.
+manifests:
+  repo: your-org/k8s
+  branch: main
+  # Promotion order, left to right; the last two feed the "Not promoted" column.
+  environments:
+    staging: overlays/staging/patches/images.yaml
+    prod: overlays/prod/patches/images.yaml
+  # Prod uses version tags (3.5.6) that hide the commit. They were copied from this
+  # environment, so its file at the promote commit gives the real commit.
+  promotedFrom: staging
+
+# Deployment name in the patch file -> source repo ("owner/name").
+services:
+  api-gateway: your-org/api-gateway
+  frontend: your-org/frontend
+
+# Waiting longer than this (oldest undeployed commit) turns red.
+staleDays: 3

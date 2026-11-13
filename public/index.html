@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Release Board</title>
+<style>
+  :root {
+    --bg:#f6f8fa; --card:#fff; --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --link:#0969da;
+    --ok:#1a7f37; --ok-bg:#dafbe1; --warn:#9a6700; --warn-bg:#fff8c5; --bad:#cf222e; --bad-bg:#ffebe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1117; --card:#161b22; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --link:#4493f8;
+      --ok:#3fb950; --ok-bg:#12261e; --warn:#d29922; --warn-bg:#272115; --bad:#f85149; --bad-bg:#2d1517;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { font:14px/1.5 system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--fg); margin:0; padding:24px 16px; }
+  main { max-width:1200px; margin:0 auto; }
+  header { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0 auto 0 0; }
+  a { color:var(--link); text-decoration:none; } a:hover { text-decoration:underline; }
+  button, label.toggle { font:inherit; padding:5px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  .muted { color:var(--muted); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; }
+  .card b { display:block; font-size:24px; line-height:1.2; }
+  .wrap { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { padding:10px 14px; text-align:left; white-space:nowrap; border-bottom:1px solid var(--line); }
+  th { position:sticky; top:0; background:var(--card); font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  tr:last-child td { border-bottom:0; }
+  .svc { font-weight:600; } .svc small { display:block; font-weight:400; }
+  .sha { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:500; }
+  .ok { color:var(--ok); background:var(--ok-bg); } .warn { color:var(--warn); background:var(--warn-bg); } .bad { color:var(--bad); background:var(--bad-bg); }
+  td .badge { margin-top:2px; }
+  .cell { display:flex; flex-direction:column; align-items:flex-start; }
+  button.badge { border:0; cursor:pointer; font:inherit; font-size:12px; font-weight:500; }
+  .age { font-size:12px; color:var(--muted); }
+  .details td { background:var(--bg); white-space:normal; padding:8px 14px 14px; }
+  .details h4 { margin:8px 0 4px; font-size:13px; }
+  .details ul { list-style:none; margin:0; padding:0; }
+  .details li { display:flex; gap:10px; padding:3px 0; align-items:baseline; flex-wrap:wrap; }
+  .details li .title { flex:1 1 300px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Release Board</h1>
+  <span id="meta" class="muted"></span>
+  <label class="toggle"><input type="checkbox" id="only"> Only needs action</label>
+  <button id="refresh">Refresh</button>
+</header>
+<div class="cards" id="cards"></div>
+<div class="wrap"><table id="t"></table></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let data = null;
+const expanded = new Set(); // "service|env" panels the user expanded; survives auto-refresh
+
+// Every API string goes through textContent / href, never innerHTML.
+const el = (tag, text, cls) => {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+};
+const link = (text, href, cls) => {
+  const a = el('a', text, cls);
+  a.href = href; a.target = '_blank'; a.rel = 'noopener';
+  return a;
+};
+const gh = (repo, path) => `https://github.com/${repo}/${path}`;
+const days = (iso) => (iso ? (Date.now() - new Date(iso)) / 864e5 : 0);
+const ago = (iso) => {
+  if (!iso) return '';
+  const d = days(iso);
+  return d >= 1 ? `${Math.floor(d)}d ago` : d * 24 >= 1 ? `${Math.floor(d * 24)}h ago` : `${Math.max(1, Math.floor(d * 1440))}m ago`;
+};
+// Colour by how long the oldest commit has waited, not by commit count.
+const level = (cmp) => (!cmp || cmp.count === 0 ? 'ok' : days(cmp.waitingSince) >= data.staleDays ? 'bad' : 'warn');
+const isStale = (cmp) => cmp?.count > 0 && days(cmp.waitingSince) >= data.staleDays;
+const needsAction = (s) =>
+  s.error || s.ci === 'failure' || s.unpromoted?.count > 0 || Object.values(s.envs).some((d) => !d || d.behind?.count > 0);
+
+function toggle(key) {
+  expanded.has(key) ? expanded.delete(key) : expanded.add(key);
+  render();
+}
+
+function pendingBadge(s, key, cmp, label) {
+  const b = el('button', `${label} · ${ago(cmp.waitingSince).replace(' ago', '')}`, `badge ${level(cmp)}`);
+  b.title = `Oldest waiting commit: ${cmp.waitingSince ? new Date(cmp.waitingSince).toLocaleString() : '?'}`;
+  b.setAttribute('aria-expanded', expanded.has(key));
+  b.onclick = () => toggle(key);
+  return b;
+}
+
+function envCell(s, k, d) {
+  const td = el('td'), box = el('div', undefined, 'cell');
+  td.append(box);
+  if (!d) { box.append(el('span', 'not deployed', 'muted')); return td; }
+  const label = el('span', undefined, 'sha');
+  if (!d.sha) label.textContent = d.tag;
+  else {
+    if (!d.tag.includes(d.sha)) label.append(el('span', `${d.tag} · `));
+    label.append(link(d.sha.slice(0, 7), gh(s.repo, `commit/${d.sha}`)));
+  }
+  box.append(label);
+  if (d.deployedAt) box.append(el('span', `deployed ${ago(d.deployedAt)}`, 'age'));
+  if (!d.behind) box.append(el('span', 'commit unknown', 'badge muted'));
+  else if (d.behind.count === 0) box.append(el('span', 'up to date', 'badge ok'));
+  else box.append(pendingBadge(s, `${s.service}|${k}`, d.behind, `${d.behind.count} behind`));
+  return td;
+}
+
+function detailsRow(s, title, cmp, compareUrl, cols) {
+  const tr = el('tr', undefined, 'details'), td = el('td');
+  td.colSpan = cols;
+  td.append(el('h4', title));
+  const ul = el('ul');
+  for (const c of cmp.commits) {
+    const li = el('li');
+    li.append(link(c.sha.slice(0, 7), gh(s.repo, `commit/${c.sha}`), 'sha'), el('span', c.title, 'title'));
+    if (c.pr) li.append(link(`#${c.pr}`, gh(s.repo, `pull/${c.pr}`)));
+    li.append(el('span', `${c.author ?? '?'} · ${ago(c.date)}`, 'age'));
+    ul.append(li);
+  }
+  td.append(ul);
+  const more = cmp.count > cmp.commits.length ? `Showing oldest ${cmp.commits.length} of ${cmp.count}. ` : '';
+  const foot = el('p', more, 'age');
+  foot.append(link('Open full compare on GitHub', compareUrl));
+  td.append(foot);
+  tr.append(td);
+  return tr;
+}
+
+const CI = { success: ['CI passing', 'ok'], failure: ['CI failing', 'bad'], pending: ['CI running', 'warn'] };
+
+function render() {
+  if (!data) return;
+  const [from, to] = data.envs.slice(-2);
+  const cols = data.envs.length + 2;
+  const rows = data.services.filter((s) => !$('only').checked || needsAction(s));
+
+  const count = (f) => data.services.filter(f).length;
+  const stale = count((s) => !s.error && (isStale(s.unpromoted) || Object.values(s.envs).some((d) => isStale(d?.behind))));
+  $('cards').replaceChildren(...[
+    ['Services', data.services.length, ''],
+    ['Needs action', count(needsAction), 'warn'],
+    [`Waiting for ${to}`, count((s) => s.unpromoted?.count > 0), 'warn'],
+    [`${from} behind main`, count((s) => s.envs?.[from]?.behind?.count > 0), 'warn'],
+    [`Waiting > ${data.staleDays}d`, stale, 'bad'],
+    ['CI failing', count((s) => s.ci === 'failure'), 'bad'],
+    ['Errors', count((s) => s.error), 'bad'],
+  ].map(([label, n, cls]) => {
+    const c = el('div', undefined, 'card');
+    const b = el('b', String(n));
+    if (cls) b.style.color = `var(--${n ? cls : 'ok'})`;
+    c.append(b, el('span', label, 'muted'));
+    return c;
+  }));
+
+  const head = el('tr');
+  ['Service', ...data.envs, `${from} → ${to}`].forEach((h) => head.append(el('th', h)));
+  const body = [];
+  for (const s of rows) {
+    const tr = el('tr'), name = el('td', undefined, 'svc');
+    const sub = el('small');
+    sub.append(link(s.repo, gh(s.repo, '')));
+    if (CI[s.ci]) sub.append(' ', link(CI[s.ci][0], gh(s.repo, `commits/${s.branch}`), `badge ${CI[s.ci][1]}`));
+    name.append(el('span', s.service), sub);
+    tr.append(name);
+    body.push(tr);
+    if (s.error) {
+      const td = el('td', s.error, 'bad');
+      td.colSpan = cols - 1;
+      tr.append(td);
+      continue;
+    }
+    data.envs.forEach((k) => tr.append(envCell(s, k, s.envs[k])));
+    const p = el('td'), a = s.envs[from], b = s.envs[to];
+    if (!s.unpromoted) p.append(el('span', '–', 'muted'));
+    else if (s.unpromoted.count === 0) p.append(el('span', 'in sync', 'badge ok'));
+    else p.append(pendingBadge(s, `${s.service}|promote`, s.unpromoted, `${s.unpromoted.count} to promote`));
+    tr.append(p);
+
+    for (const k of data.envs) {
+      const d = s.envs[k];
+      if (expanded.has(`${s.service}|${k}`) && d?.behind?.count)
+        body.push(detailsRow(s, `${s.branch} commits not on ${k}`, d.behind, gh(s.repo, `compare/${d.sha}...${s.branch}`), cols));
+    }
+    if (expanded.has(`${s.service}|promote`) && s.unpromoted?.count)
+      body.push(detailsRow(s, `On ${from}, not yet on ${to}`, s.unpromoted, gh(s.repo, `compare/${b.sha}...${a.sha}`), cols));
+  }
+  if (!body.length) {
+    const tr = el('tr'), td = el('td', 'Everything is deployed and promoted.', 'muted');
+    td.colSpan = cols;
+    tr.append(td); body.push(tr);
+  }
+  $('t').replaceChildren(head, ...body);
+  $('meta').textContent = `updated ${new Date(data.updated).toLocaleTimeString()}`;
+}
+
+async function load() {
+  $('meta').textContent = 'loading…';
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) throw new Error(await r.text());
+    data = await r.json();
+    render();
+  } catch (e) {
+    $('meta').textContent = `error: ${e.message}`;
+  }
+}
+$('refresh').onclick = load;
+$('only').onchange = render;
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>
